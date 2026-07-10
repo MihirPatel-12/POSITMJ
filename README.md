@@ -74,7 +74,7 @@ That's it — POSITMJ is published on PyPI: https://pypi.org/project/POSITMJ/
 For local/editable development (from source):
 
 ```bash
-git clone https://github.com/yourusername/POSITMJ.git
+git https://github.com/MihirPatel-12/POSITMJ
 cd POSITMJ
 pip install -e .
 ```
