@@ -1,0 +1,14 @@
+# MANIFEST.in
+# Tells the Python packaging tools which extra (non-.py) files to include
+# in the source distribution (sdist), on top of what setuptools/pyproject
+# picks up automatically.
+
+include README.md
+include LICENSE
+include CHANGELOG.md
+include pyproject.toml
+
+recursive-include tests *.py
+
+global-exclude __pycache__
+global-exclude *.py[co]
