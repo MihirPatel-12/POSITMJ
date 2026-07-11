@@ -35,7 +35,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.datasets import load_iris, load_wine, load_breast_cancer
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __all__ = [
     "DatasetLoader",
     "MLPBuilder",
@@ -390,6 +390,30 @@ class PositConverter:
 
         return posit_int & ((1 << n) - 1)
 
+    def posit_bits_to_float(self, bit_int: int) -> float:
+        """Decode a signed n-bit posit bit pattern back to a Python float.
+
+        Public counterpart to ``float_to_posit_bits`` - handles the sign
+        (two's complement) on top of ``_decode_magnitude``, so it can be
+        used to annotate exported ROMs with the original decimal value.
+        """
+        n = self.n
+        bit_int &= (1 << n) - 1
+
+        if bit_int == 0:
+            return 0.0
+        if bit_int == (1 << (n - 1)):
+            return float("nan")  # NaR (Not a Real)
+
+        sign = (bit_int >> (n - 1)) & 1
+        if sign:
+            magnitude_bits = ((~bit_int) + 1) & ((1 << n) - 1)
+        else:
+            magnitude_bits = bit_int
+
+        value = self._decode_magnitude(magnitude_bits)
+        return -value if sign else value
+
     def convert_array(self, arr: np.ndarray) -> np.ndarray:
         """Vectorized conversion of a numpy array to posit bit patterns."""
         flat = arr.flatten()
@@ -425,27 +449,49 @@ class PositExporter:
                 f.write(f"{int(v):0{hex_width}x}\n")
         return path
 
-    def to_lut_verilog(self, posit_array, module_name, filename=None):
-        """Write posit values as a synthesizable Verilog ROM/LUT module."""
+    def to_lut_verilog(self, posit_array, module_name, filename=None,
+                        decode_fn=None):
+        """Write posit values as a synthesizable Verilog ROM/LUT module.
+
+        Parameters
+        ----------
+        decode_fn : callable, optional
+            If given, called as ``decode_fn(bit_int)`` to recover the
+            original float for each entry, which is then written as a
+            trailing ``// <value>`` comment (e.g. from
+            ``PositConverter.posit_bits_to_float``). Values are emitted in
+            hex (``16'hXXXX``) when ``decode_fn`` is provided, matching the
+            hardware-team ROM format; otherwise plain decimal is used.
+        """
         filename = filename or f"{module_name}.v"
         path = os.path.join(self.output_dir, filename)
         flat = posit_array.flatten()
         depth = len(flat)
         addr_width = max(1, int(np.ceil(np.log2(depth)))) if depth > 1 else 1
+        hex_width = self.n // 4 if self.n % 4 == 0 else (self.n // 4) + 1
 
-        lines = [
-            f"module {module_name} (",
-            f"    input  wire [{addr_width - 1}:0] addr,",
-            f"    output reg  [{self.n - 1}:0] data",
+        lines = ["`timescale 1ns / 1ps", "", f"module {module_name}("]
+        lines += [
+            f"    input [{addr_width - 1}:0] addr,",
+            f"    output reg [{self.n - 1}:0] data",
             ");",
             "",
             "always @(*) begin",
             "    case (addr)",
         ]
         for i, v in enumerate(flat):
-            lines.append(f"        {addr_width}'d{i}: data = {self.n}'d{int(v)};")
+            v = int(v)
+            if decode_fn is not None:
+                comment = f" // {decode_fn(v)}"
+                value_str = f"{self.n}'h{v:0{hex_width}X}"
+                lines.append(f"        {addr_width}'d{i} : data = {value_str};{comment}")
+            else:
+                lines.append(f"        {addr_width}'d{i}: data = {self.n}'d{v};")
+        if decode_fn is not None:
+            lines.append(f"        default : data = {self.n}'h{0:0{hex_width}X};")
+        else:
+            lines.append(f"        default: data = {self.n}'d0;")
         lines += [
-            f"        default: data = {self.n}'d0;",
             "    endcase",
             "end",
             "",
@@ -456,16 +502,19 @@ class PositExporter:
             f.write("\n".join(lines))
         return path
 
-    def export(self, posit_array, name, mode="lut"):
+    def export(self, posit_array, name, mode="lut", decode_fn=None):
         """
         Parameters
         ----------
         mode : str
             'lut' -> synthesizable Verilog LUT/ROM module
             'mem' -> plain .mem hex file (for $readmemh)
+        decode_fn : callable, optional
+            Passed through to ``to_lut_verilog`` to annotate each ROM entry
+            with its original decoded float value (hex + comment style).
         """
         if mode == "lut":
-            return self.to_lut_verilog(posit_array, module_name=name)
+            return self.to_lut_verilog(posit_array, module_name=name, decode_fn=decode_fn)
         elif mode == "mem":
             return self.to_mem_file(posit_array, filename=f"{name}.mem")
         else:
@@ -534,12 +583,28 @@ class PositMLPPipeline:
         return self.export(mode=choice)
 
     # Stage 4b: export programmatically
-    def export(self, mode="lut"):
+    def export(self, mode="lut", annotate=True, naming="rom"):
+        """
+        Parameters
+        ----------
+        mode : str
+            'lut' -> synthesizable Verilog LUT/ROM module, 'mem' -> hex .mem file.
+        annotate : bool
+            When True (default) and mode='lut', each ROM entry is written in
+            hex with a trailing ``// <decoded float>`` comment - matching the
+            hardware-team ROM format (e.g. ``b1_rom.v``).
+        naming : str
+            'rom'   -> "w{i}_rom" / "b{i}_rom"      (hardware-team convention)
+            'layer' -> "layer{i}_weights" / "layer{i}_biases" (legacy default)
+        """
+        decode_fn = self.converter.posit_bits_to_float if (annotate and mode == "lut") else None
+        w_tag, b_tag = ("w{}_rom", "b{}_rom") if naming == "rom" else ("layer{}_weights", "layer{}_biases")
+
         paths = []
         for i, w in enumerate(self.posit_weights):
-            paths.append(self.exporter.export(w, name=f"layer{i}_weights", mode=mode))
+            paths.append(self.exporter.export(w, name=w_tag.format(i), mode=mode, decode_fn=decode_fn))
         for i, b in enumerate(self.posit_biases):
-            paths.append(self.exporter.export(b, name=f"layer{i}_biases", mode=mode))
+            paths.append(self.exporter.export(b, name=b_tag.format(i), mode=mode, decode_fn=decode_fn))
         print(f"[PositMLPPipeline] Exported {len(paths)} files to "
               f"'{self.exporter.output_dir}' (mode={mode}).")
         return paths
